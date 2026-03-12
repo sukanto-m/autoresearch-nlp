@@ -35,6 +35,27 @@ The current `train.py` is a single-file autonomous tuning target for a Reddit/ne
 
 So the repo still matches the original autoresearch spirit, but the experiment itself is no longer "train a better tiny language model overnight"; it is "let the agent search for a better classifier under a fixed time budget".
 
+## Results so far
+
+This fork already includes one short autonomous tuning run, summarized in `results.png` and reflected by the recent experiment commits on the `autoresearch/mar12-gpu` branch that was later merged back to `master`.
+
+- 5 experiments were recorded
+- 1 experiment was kept and 4 were discarded
+- 0 crashes were recorded
+- best observed validation accuracy was **0.8125** on commit `c102a9a`
+- peak memory ranged from roughly **0.2 GB** to **1.6 GB** across the tested variants
+
+From the commit history, the explored changes included:
+
+- adding PAD-aware attention pooling (`attn_last`)
+- lowering weight decay
+- increasing depth to 4
+- scaling to depth 6 / width 384 with lower learning rates
+
+At least in this first pass, the baseline configuration remained the best result, which is a useful outcome in itself: the autoresearch loop quickly rejected several plausible modifications without beating the starting point.
+
+Note: `results.tsv` is referenced by the analysis notebook and agent workflow, but it is not currently present in this checkout. The summary above is based on the persisted experiment artifacts already in the repo (`results.png` plus recent experiment commits).
+
 ## How it works
 
 The repo is deliberately kept small and only really has three files that matter:
