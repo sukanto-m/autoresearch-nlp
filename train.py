@@ -65,7 +65,7 @@ class GPTConfig:
     resid_dropout: float = 0.10
     mlp_dropout: float = 0.10
     classifier_dropout: float = 0.20
-    pooling: str = "mean_last"  # mean, last, mean_last
+    pooling: str = "attn_last"  # mean, last, mean_last, attn, attn_last
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -170,7 +170,8 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.classifier_dropout = nn.Dropout(config.classifier_dropout)
-        pool_mult = 2 if config.pooling == "mean_last" else 1
+        self.attn_pool = nn.Linear(config.n_embd, 1, bias=False)
+        pool_mult = 2 if config.pooling in ("mean_last", "attn_last") else 1
         self.classifier_head = nn.Linear(pool_mult * config.n_embd, 1)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
@@ -192,6 +193,7 @@ class GPT(nn.Module):
         device_type = self.transformer.wte.weight.device.type
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.classifier_head.weight, mean=0.0, std=0.001)
+        torch.nn.init.zeros_(self.attn_pool.weight)
         if self.classifier_head.bias is not None:
             torch.nn.init.zeros_(self.classifier_head.bias)
             
@@ -331,6 +333,19 @@ class GPT(nn.Module):
             last_pos = (lengths - 1).clamp_min(0)
             x_last = x[torch.arange(B, device=x.device), last_pos]
             x_pool = torch.cat([x_mean, x_last], dim=-1)
+        elif self.config.pooling == "attn":
+            attn_logits = self.attn_pool(x).squeeze(-1).float()
+            attn_logits = attn_logits.masked_fill(~mask, -1e9)
+            attn_w = F.softmax(attn_logits, dim=1).to(dtype=x.dtype)
+            x_pool = (x * attn_w.unsqueeze(-1)).sum(dim=1)
+        elif self.config.pooling == "attn_last":
+            last_pos = (lengths - 1).clamp_min(0)
+            x_last = x[torch.arange(B, device=x.device), last_pos]
+            attn_logits = self.attn_pool(x).squeeze(-1).float()
+            attn_logits = attn_logits.masked_fill(~mask, -1e9)
+            attn_w = F.softmax(attn_logits, dim=1).to(dtype=x.dtype)
+            x_attn = (x * attn_w.unsqueeze(-1)).sum(dim=1)
+            x_pool = torch.cat([x_attn, x_last], dim=-1)
         else:
             raise ValueError(f"Unknown pooling: {self.config.pooling}")
 
@@ -511,7 +526,7 @@ def build_model_config(depth):
         resid_dropout=0.10,
         mlp_dropout=0.10,
         classifier_dropout=0.20,
-        pooling="mean_last",
+        pooling="attn_last",
     )
 
 config = build_model_config(DEPTH)
