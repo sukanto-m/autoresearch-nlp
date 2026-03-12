@@ -6,15 +6,44 @@
 
 The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069).
 
+## Fork note: this repo is an experiment
+
+This fork keeps the original "let an agent iterate on `train.py` under a fixed 5-minute budget" idea from [karpathy/autoresearch](https://github.com/karpathy/autoresearch/tree/master), but repurposes it for a different task: binary sequence classification on preprocessed text tensors instead of language-model pretraining on climbmix.
+
+In practice, this means the current repo is best read as an `autoresearch`-style research harness for a small NLP classification problem. Some upstream files and wording are still present for reference, but the active experiment path in this fork is the classifier in `train.py`.
+
+## What changed from the original repo
+
+Compared with the upstream repository:
+
+- **Objective:** upstream optimizes `val_bpb` for next-token prediction; this fork optimizes `val_accuracy` for binary classification.
+- **Data path:** upstream expects `prepare.py` to download climbmix shards and train a tokenizer; this fork trains from checked-in `train_data.pt` and `val_data.pt`, with source CSVs in `technology.csv` and `data_for_preprocessing.csv`.
+- **Model behavior:** upstream uses a causal GPT for language modeling; this fork switches to non-causal, bidirectional attention plus padding-aware pooling for sequence classification.
+- **Sequence budget:** upstream runs at `MAX_SEQ_LEN=2048`; this fork reduces that to `256`, which makes faster, smaller classification experiments practical.
+- **Outputs:** upstream logs `val_bpb`, MFU, token throughput, and parameter count; this fork reports `val_accuracy`, runtime, VRAM, step count, and depth.
+- **Artifacts:** this fork adds experiment outputs such as `results.png` and keeps local tensor datasets in-repo to shorten setup.
+
+## Current experiment setup
+
+The current `train.py` is a single-file autonomous tuning target for a Reddit/news-style text classification workflow:
+
+- input batches come from `train_data.pt` and `val_data.pt`
+- labels are binary
+- training still runs with a fixed 5-minute wall-clock budget
+- the model is a GPT-style transformer adapted for classification
+- the main score to beat is `val_accuracy`
+
+So the repo still matches the original autoresearch spirit, but the experiment itself is no longer "train a better tiny language model overnight"; it is "let the agent search for a better classifier under a fixed time budget".
+
 ## How it works
 
 The repo is deliberately kept small and only really has three files that matter:
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
+- **`prepare.py`** — mostly retained from upstream; contains tokenizer/data utilities for the original pretraining setup and is not the main path for this fork's checked-in classification tensors.
+- **`train.py`** — the single file the agent edits. In this fork it contains the GPT-style classifier, optimizer (Muon + AdamW), and 5-minute training loop. **This file is edited and iterated on by the agent**.
 - **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. In the original repo the metric is **val_bpb**; in this fork the active score is **val_accuracy** on the held-out classification set.
 
 If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
 
@@ -30,14 +59,13 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # 2. Install dependencies
 uv sync
 
-# 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
-
-# 4. Manually run a single training experiment (~5 min)
+# 3. Run a single classification experiment (~5 min)
 uv run train.py
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+In this fork, the preprocessed tensors are already checked into the repo, so `prepare.py` is not part of the default training path.
+
+If you want to compare against the original upstream workflow, that original setup is still documented in [karpathy/autoresearch](https://github.com/karpathy/autoresearch/tree/master), where `prepare.py` downloads climbmix data and trains the tokenizer used for language-model experiments.
 
 ## Running the agent
 
@@ -52,10 +80,15 @@ The `program.md` file is essentially a super lightweight "skill".
 ## Project structure
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
+prepare.py                 — upstream-style data/tokenizer utilities kept for reference
+train.py                   — classification model, optimizer, and 5-minute training loop
+program.md                 — agent instructions for autonomous experiments
+technology.csv             — source dataset slice
+data_for_preprocessing.csv — preprocessing input data
+train_data.pt              — preprocessed training tensors
+val_data.pt                — preprocessed validation tensors
+results.png                — experiment plot
+pyproject.toml             — dependencies
 ```
 
 ## Design choices
