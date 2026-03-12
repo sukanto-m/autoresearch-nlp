@@ -1,7 +1,7 @@
 """
 Autoresearch sequence classification script. Single-GPU, single-file.
-Adapted for Binary Classification (Human vs AI text).
-Replaced FA3 with PyTorch native SDPA for universal GPU compatibility.
+Adapted for Binary Classification (Reddit Traction Predictor).
+Uses PyTorch native SDPA for universal GPU compatibility.
 """
 
 import os
@@ -11,21 +11,16 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import gc
 import math
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Environment capability detection. Keep this near the top because we use it
-# to decide whether to enable compilation for some hot-path functions.
-HAS_CUDA = torch.cuda.is_available() and torch.cuda.device_count() > 0
-USE_COMPILE = HAS_CUDA
-
 # Hardcoded constants
 MAX_SEQ_LEN = 256
 TIME_BUDGET = 300 # 5 minutes
+PAD_TOKEN_ID = 50256  # GPT-2 <|endoftext|> used for padding in prepare.py
 
 # ---------------------------------------------------------------------------
 # Data Loading
@@ -42,6 +37,10 @@ def get_batch(split, batch_size):
     data_x = x_train if split == 'train' else x_val
     data_y = y_train if split == 'train' else y_val
     
+    # Deterministic validation sampling for consistent baselines
+    if split == 'val':
+        torch.manual_seed(42)
+        
     ix = torch.randint(len(data_x), (batch_size,))
     
     x = data_x[ix].to(device)
@@ -61,15 +60,18 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
-
+    is_causal: bool = False  # classification: allow bidirectional attention
+    attn_dropout: float = 0.10
+    resid_dropout: float = 0.10
+    mlp_dropout: float = 0.10
+    classifier_dropout: float = 0.20
+    pooling: str = "mean_last"  # mean, last, mean_last
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
-
 def has_ve(layer_idx, n_layer):
     return layer_idx % 2 == (n_layer - 1) % 2
-
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4
@@ -79,13 +81,14 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
+        self.is_causal = config.is_causal
+        self.attn_dropout_p = float(config.attn_dropout)
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
@@ -112,47 +115,50 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k)
 
         # PyTorch Native SDPA
-        q = q.transpose(1, 2) # (B, n_head, T, head_dim)
-        k = k.transpose(1, 2) # (B, n_kv_head, T, head_dim)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        # Handle Grouped Query Attention if n_kv_head < n_head
         if self.n_kv_head < self.n_head:
             num_repeat = self.n_head // self.n_kv_head
             k = torch.repeat_interleave(k, num_repeat, dim=1)
             v = torch.repeat_interleave(v, num_repeat, dim=1)
 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=(self.attn_dropout_p if self.training else 0.0),
+            is_causal=self.is_causal,
+        )
         
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
-
 
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.dropout = nn.Dropout(config.mlp_dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square()
+        x = F.gelu(x, approximate="tanh")
+        x = self.dropout(x)
         x = self.c_proj(x)
         return x
-
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.resid_dropout = nn.Dropout(config.resid_dropout)
 
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        x = x + self.resid_dropout(self.attn(norm(x), ve, cos_sin, window_size))
+        x = x + self.resid_dropout(self.mlp(norm(x)))
         return x
-
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -163,10 +169,9 @@ class GPT(nn.Module):
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
-        self.classifier_head = nn.Linear(config.n_embd, 1)
-        # Learnable pooling tends to work better for classification than a raw mean over tokens.
-        self.pool_query = nn.Parameter(torch.zeros(config.n_embd))
-        self.pool_dropout = nn.Dropout(POOL_DROPOUT)
+        self.classifier_dropout = nn.Dropout(config.classifier_dropout)
+        pool_mult = 2 if config.pooling == "mean_last" else 1
+        self.classifier_head = nn.Linear(pool_mult * config.n_embd, 1)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         
@@ -184,9 +189,9 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
+        device_type = self.transformer.wte.weight.device.type
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.classifier_head.weight, mean=0.0, std=0.001)
-        torch.nn.init.normal_(self.pool_query, mean=0.0, std=0.02)
         if self.classifier_head.bias is not None:
             torch.nn.init.zeros_(self.classifier_head.bias)
             
@@ -212,7 +217,7 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        if HAS_CUDA:
+        if device_type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
@@ -225,7 +230,7 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        if HAS_CUDA:
+        if getattr(device, "type", None) == "cuda":
             cos, sin = cos.bfloat16(), sin.bfloat16()
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
@@ -313,23 +318,26 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i])
         x = norm(x)
 
-        if POOLING == "mean":
-            x_pool = x.mean(dim=1)
-        elif POOLING == "max":
-            x_pool = x.amax(dim=1)
-        elif POOLING == "attn":
-            # Attention pooling: softmax over tokens with a learned query vector.
-            scores = (x * self.pool_query).sum(dim=-1)
-            w = scores.softmax(dim=1)
-            x_pool = (w.unsqueeze(-1) * x).sum(dim=1)
-        else:
-            raise ValueError(f"unknown POOLING={POOLING!r}")
+        mask = (idx != PAD_TOKEN_ID)
+        lengths = mask.sum(dim=1).clamp_min(1)
+        x_mean = (x * mask.unsqueeze(-1)).sum(dim=1) / lengths.unsqueeze(-1)
 
-        x_pool = self.pool_dropout(x_pool)
-        logits = self.classifier_head(x_pool).squeeze(-1)
+        if self.config.pooling == "mean":
+            x_pool = x_mean
+        elif self.config.pooling == "last":
+            last_pos = (lengths - 1).clamp_min(0)
+            x_pool = x[torch.arange(B, device=x.device), last_pos]
+        elif self.config.pooling == "mean_last":
+            last_pos = (lengths - 1).clamp_min(0)
+            x_last = x[torch.arange(B, device=x.device), last_pos]
+            x_pool = torch.cat([x_mean, x_last], dim=-1)
+        else:
+            raise ValueError(f"Unknown pooling: {self.config.pooling}")
+
+        logits = self.classifier_head(self.classifier_dropout(x_pool)).squeeze(-1)
 
         if targets is not None:
-            loss = F.binary_cross_entropy_with_logits(logits, targets, reduction=reduction)
+            loss = F.binary_cross_entropy_with_logits(logits.float(), targets, reduction=reduction)
             return loss
         return logits
 
@@ -345,7 +353,7 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-def _adamw_step_impl(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
+def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
@@ -355,12 +363,12 @@ def _adamw_step_impl(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-def _muon_step_impl(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
+def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
-    X = g.bfloat16()
+    X = g.bfloat16() if g.is_cuda else g
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
     if g.size(-2) > g.size(-1):
         for a, b, c in polar_express_coeffs[:ns_steps]:
@@ -389,12 +397,10 @@ def _muon_step_impl(stacked_grads, stacked_params, momentum_buffer, second_momen
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
-if USE_COMPILE:
-    adamw_step_fused = torch.compile(_adamw_step_impl, dynamic=False, fullgraph=True)
-    muon_step_fused = torch.compile(_muon_step_impl, dynamic=False, fullgraph=True)
-else:
-    adamw_step_fused = _adamw_step_impl
-    muon_step_fused = _muon_step_impl
+USE_TORCH_COMPILE = os.environ.get("DISABLE_TORCH_COMPILE", "0") != "1"
+if USE_TORCH_COMPILE:
+    adamw_step_fused = torch.compile(adamw_step_fused, dynamic=False, fullgraph=True)
+    muon_step_fused = torch.compile(muon_step_fused, dynamic=False, fullgraph=True)
 
 class MuonAdamW(torch.optim.Optimizer):
     def __init__(self, param_groups):
@@ -462,25 +468,22 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-ASPECT_RATIO = 8       
+ASPECT_RATIO = 8        # Baseline width
 HEAD_DIM = 128          
 WINDOW_PATTERN = "SSSL" 
-
-POOLING = "attn"       # "mean", "max", "attn"
-POOL_DROPOUT = 0.1
 
 TOTAL_BATCH_SIZE = 2**14 
 EMBEDDING_LR = 0.6      
 UNEMBEDDING_LR = 0.004  
 MATRIX_LR = 0.04        
 SCALAR_LR = 0.5         
-WEIGHT_DECAY = 0.05
+WEIGHT_DECAY = 0.2      
 ADAM_BETAS = (0.8, 0.95)
-WARMUP_RATIO = 0.0      
+WARMUP_RATIO = 0.05
 WARMDOWN_RATIO = 0.5    
 FINAL_LR_FRAC = 0.0     
 
-DEPTH = 2        
+DEPTH = 2               # Baseline depth
 DEVICE_BATCH_SIZE = 32  
 
 # ---------------------------------------------------------------------------
@@ -490,18 +493,9 @@ DEVICE_BATCH_SIZE = 32
 t_start = time.time()
 torch.manual_seed(42)
 torch.set_float32_matmul_precision("high")
-
-# CPU-only environments should still be able to run, even if slower.
-if HAS_CUDA:
-    device = torch.device("cuda")
-    torch.cuda.manual_seed(42)
-    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-    sync_device = torch.cuda.synchronize
-else:
-    device = torch.device("cpu")
-    autocast_ctx = nullcontext()
-    sync_device = lambda: None
-
+device = torch.device("cuda")
+torch.cuda.manual_seed(42)
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 def build_model_config(depth):
@@ -512,6 +506,12 @@ def build_model_config(depth):
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
+        is_causal=False,
+        attn_dropout=0.10,
+        resid_dropout=0.10,
+        mlp_dropout=0.10,
+        classifier_dropout=0.20,
+        pooling="mean_last",
     )
 
 config = build_model_config(DEPTH)
@@ -539,7 +539,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-if USE_COMPILE:
+if USE_TORCH_COMPILE:
     model = torch.compile(model, dynamic=False)
 
 x, y = get_batch('train', DEVICE_BATCH_SIZE)
@@ -570,7 +570,7 @@ total_training_time = 0
 step = 0
 
 while True:
-    sync_device()
+    torch.cuda.synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -597,7 +597,7 @@ while True:
         print("FAIL")
         exit(1)
 
-    sync_device()
+    torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
 
@@ -645,14 +645,12 @@ def evaluate_accuracy(model, batch_size):
     model.train()
     return correct / total
 
-# Deterministic validation sampling so small code changes are comparable.
-_cpu_rng_state = torch.random.get_rng_state()
-torch.manual_seed(12345)
 val_accuracy = evaluate_accuracy(model, DEVICE_BATCH_SIZE)
-torch.random.set_rng_state(_cpu_rng_state)
 
 t_end = time.time()
-peak_vram_mb = (torch.cuda.max_memory_allocated() / 1024 / 1024) if HAS_CUDA else 0.0
+peak_vram_mb = (
+    torch.cuda.max_memory_allocated() / 1024 / 1024
+)
 
 print("---")
 print(f"val_accuracy:     {val_accuracy:.4f}")
