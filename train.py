@@ -164,6 +164,9 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.classifier_head = nn.Linear(config.n_embd, 1)
+        # Learnable pooling tends to work better for classification than a raw mean over tokens.
+        self.pool_query = nn.Parameter(torch.zeros(config.n_embd))
+        self.pool_dropout = nn.Dropout(POOL_DROPOUT)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         
@@ -183,6 +186,7 @@ class GPT(nn.Module):
     def init_weights(self):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.classifier_head.weight, mean=0.0, std=0.001)
+        torch.nn.init.normal_(self.pool_query, mean=0.0, std=0.02)
         if self.classifier_head.bias is not None:
             torch.nn.init.zeros_(self.classifier_head.bias)
             
@@ -309,7 +313,19 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i])
         x = norm(x)
 
-        x_pool = x.mean(dim=1) 
+        if POOLING == "mean":
+            x_pool = x.mean(dim=1)
+        elif POOLING == "max":
+            x_pool = x.amax(dim=1)
+        elif POOLING == "attn":
+            # Attention pooling: softmax over tokens with a learned query vector.
+            scores = (x * self.pool_query).sum(dim=-1)
+            w = scores.softmax(dim=1)
+            x_pool = (w.unsqueeze(-1) * x).sum(dim=1)
+        else:
+            raise ValueError(f"unknown POOLING={POOLING!r}")
+
+        x_pool = self.pool_dropout(x_pool)
         logits = self.classifier_head(x_pool).squeeze(-1)
 
         if targets is not None:
@@ -449,6 +465,9 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 8       
 HEAD_DIM = 128          
 WINDOW_PATTERN = "SSSL" 
+
+POOLING = "attn"       # "mean", "max", "attn"
+POOL_DROPOUT = 0.1
 
 TOTAL_BATCH_SIZE = 2**14 
 EMBEDDING_LR = 0.6      
