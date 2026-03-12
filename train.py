@@ -483,7 +483,7 @@ WARMUP_RATIO = 0.05
 WARMDOWN_RATIO = 0.5    
 FINAL_LR_FRAC = 0.0     
 
-DEPTH = 4               # More depth, same width
+DEPTH = 2               # Baseline depth
 DEVICE_BATCH_SIZE = 32  
 
 # ---------------------------------------------------------------------------
